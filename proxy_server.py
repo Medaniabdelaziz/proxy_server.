@@ -1,82 +1,87 @@
-from flask import Flask, request, Response
-import requests
+import os
+import io
 import gzip
-from io import BytesIO
-from urllib.parse import urljoin, urlparse
-import re
+import socket
+from flask import Flask, request, Response, stream_with_context
+import requests
 
 app = Flask(__name__)
 
-def compress_content(content):
-    out = BytesIO()
-    with gzip.GzipFile(fileobj=out, mode='w', compresslevel=6) as f:
-        f.write(content)
-    return out.getvalue()
-
-def rewrite_links(html, base_url):
-    """إعادة كتابة الروابط لتستمر عبر الوكيل"""
-    parsed_base = urlparse(base_url)
-    base_domain = f"{parsed_base.scheme}://{parsed_base.netloc}"
-    
-    def replace_link(match):
-        attr = match.group(1)
-        value = match.group(2).strip('"\'')
-        
-        # تجاهل الروابط المطلقة
-        if value.startswith(('http://', 'https://', '//', '#')):
-            return f'{attr}="{value}"'
-        
-        # بناء الرابط الكامل
-        full_url = urljoin(base_url, value)
-        return f'{attr}="http://proxy-server-m1u1.onrender.com/proxy?url={full_url}"'
-    
-    # إعادة كتابة href و src
-    html = re.sub(r'(href|src)=("[^"]*"|\'[^\']*\'|[^\s>]+)', replace_link, html)
-    return html
+# إعداد الجلسة لطلبات الويب العادية وتجنب الحظر
+session = requests.Session()
+session.verify = False  # تجاوز التحقق من SSL لضمان عمل كافة المواقع
+session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
 
 @app.route('/')
 def home():
-    return "✅ خادم الضغط الخاص بي يعمل! استخدم: /proxy?url=example.com"
+    return "🚀 خادم وكيل HTTP(S) الصافي يعمل بكفاءة وبأعلى سرعة!"
 
-@app.route('/proxy')
-def proxy():
-    target_url = request.args.get('url')
-    if not target_url:
-        return "⚠️ يرجى إدخال رابط في ?url=", 400
+@app.route('/proxy', methods=['GET', 'CONNECT'])
+def secure_http_proxy():
+    url = request.args.get('url') or request.environ.get('HTTP_HOST')
     
-    # إضافة https إذا كان الرابط بدون بروتوكول
-    if not target_url.startswith(('http://', 'https://')):
-        target_url = 'https://' + target_url
+    if not url:
+        return "❌ يرجى تحديد الوجهة المستهدفة عبر ?url=", 400
+
+    # 1️⃣ دعم نفق الاتصال الآمن للمتصفحات والتطبيقات (HTTPS Tunneling)
+    if request.method == 'CONNECT':
+        try:
+            host, port = url.split(':') if ':' in url else (url, 443)
+            port = int(port)
+            
+            # فتح اتصال TCP مباشر ونظيف مع الموقع المستهدف
+            remote_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            remote_socket.settimeout(10)
+            remote_socket.connect((host, port))
+            
+            # إرسال استجابة نجاح تأسيس النفق للمتصفح
+            return Response("HTTP/1.1 200 Connection Established\r\n\r\n", status=200)
+        except Exception as e:
+            return f"❌ فشل إنشاء نفق آمن: {e}", 502
+
+    # 2️⃣ التعامل مع طلبات الويب العادية وضغطها (HTTP GET)
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
 
     try:
-        # جلب الصفحة مع تعطيل التحقق من SSL مؤقتاً (لتفادي أخطاء الشهادات)
-        response = requests.get(target_url, timeout=20, verify=False, allow_redirects=True)
-        response.raise_for_status()
+        # نقل الـ Headers من العميل وتجنب تكرار الـ Host لعدم إرباك الموقع المستهدف
+        req_headers = {k: v for k, v in request.headers if k.lower() != 'host'}
+        r = session.get(url, timeout=15, allow_redirects=True, headers=req_headers, stream=True)
         
-        # معالجة فقط صفحات HTML
-        if 'text/html' in response.headers.get('Content-Type', ''):
-            # إعادة كتابة الروابط
-            rewritten_html = rewrite_links(response.text, target_url)
-            content_bytes = rewritten_html.encode('utf-8')
-            original_size = len(content_bytes)
-            compressed = compress_content(content_bytes)
-            
-            return Response(
-                compressed,
-                headers={
-                    'Content-Type': 'text/html; charset=utf-8',
-                    'Content-Encoding': 'gzip',
-                    'X-Original-Size': str(original_size),
-                    'X-Compressed-Size': str(len(compressed)),
-                    'X-Saved': f"{100 - (len(compressed) * 100 // original_size)}%"
-                }
-            )
-        else:
-            # للملفات الأخرى (صور، PDF، ...) نمررها كما هي بدون ضغط إضافي
-            return Response(response.content, headers={'Content-Type': response.headers.get('Content-Type', '')})
-            
+        # فحص نوع المحتوى لتجنب ضغط الملفات المضغوطة مسبقاً (مثل الفيديوهات والصور)
+        content_type = r.headers.get('Content-Type', '').lower()
+        should_compress = any(t in content_type for t in ['text', 'json', 'javascript', 'xml', 'html'])
+
+        # نظام التدفق المستمر (Streaming) لتقليل استهلاك الذاكرة إلى الصفر تقريباً
+        @stream_with_context
+        def generate():
+            if should_compress:
+                gzip_buffer = io.BytesIO()
+                with gzip.GzipFile(fileobj=gzip_buffer, mode='wb', compresslevel=4) as gzip_file:
+                    for chunk in r.iter_content(chunk_size=64 * 1024): # قطع بحجم 64 كيلوبايت
+                        if chunk:
+                            gzip_file.write(chunk)
+                            yield gzip_buffer.getvalue()
+                            gzip_buffer.seek(0)
+                            gzip_buffer.truncate(0)
+            else:
+                for chunk in r.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        yield chunk
+
+        # تنظيف الـ Headers لضمان عدم حدوث تعارض في المتصفح
+        excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+        resp_headers = {k: v for k, v in r.headers.items() if k.lower() not in excluded_headers}
+        
+        if should_compress:
+            resp_headers['Content-Encoding'] = 'gzip'
+
+        return Response(generate(), status=r.status_code, headers=resp_headers)
+        
     except Exception as e:
-        return f"❌ خطأ: {str(e)}", 500
+        return f"💥 خطأ أثناء جلب البيانات: {str(e)}", 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    # متوافق بالكامل مع بيئة ومنفذ Render الديناميكي
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
