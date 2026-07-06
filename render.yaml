@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: rethink-proxy
+    env: python
+    region: oregon # يمكنك تغيير المنطقة
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn proxy_server:app --workers 2 --timeout 120
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
